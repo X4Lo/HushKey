@@ -1,0 +1,26 @@
+// Design tokens. Dark is the default; `Theme.dark` is driven from Rust via MainWindow.dark.
+
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <color> bg: dark ? #0d0f13 : #f3f4f7;
+    out property <color> surface: dark ? #161920 : #ffffff;
+    out property <color> surface-hover: dark ? #1c2029 : #f7f8fa;
+    out property <color> surface-sunken: dark ? #11141a : #eceef2;
+    out property <color> border: dark ? #232833 : #e2e5eb;
+    out property <color> border-strong: dark ? #323949 : #cfd4dc;
+    out property <color> text: dark ? #e9ebf0 : #12141a;
+    out property <color> text-muted: dark ? #8b92a1 : #687080;
+    out property <color> text-faint: dark ? #5d6473 : #9aa1ae;
+
+    out property <color> accent: #7b6bff;
+    out property <color> accent-strong: #5b49f2;
+    out property <color> accent-soft: dark ? #7b6bff24 : #7b6bff1a;
+    out property <color> danger: #ff5a6a;
+    out property <color> danger-soft: dark ? #ff5a6a26 : #ff5a6a1c;
+    out property <color> success: #34c98a;
+
+    out property <length> radius: 14px;
+    out property <length> radius-sm: 9px;
+    out property <duration> fast: 140ms;
+}

@@ -1,0 +1,595 @@
+import { ListView, ScrollView, Palette } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import {
+    SpeakerIcon, ThemeIcon, IconButton, Tabs, Switch, ShortcutChip, SettingRow, Card, SectionLabel
+} from "widgets.slint";
+
+export { Toast } from "toast.slint";
+
+export struct AppRow {
+    key: string,
+    name: string,
+    subtitle: string,
+    icon: image,
+    has-icon: bool,
+    initial: string,
+    tint: color,
+    running: bool,
+    muted: bool,
+    volume: float,      // 0..1, < 0 when unknown
+    shortcut: string,   // display label, "" when unbound
+}
+
+component Avatar inherits Rectangle {
+    in property <AppRow> app;
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: app.has-icon ? transparent : app.tint;
+    if app.has-icon: Image {
+        source: root.app.icon;
+        width: 32px;
+        height: 32px;
+        image-fit: contain;
+    }
+    if !app.has-icon: Text {
+        text: root.app.initial;
+        color: white;
+        font-size: 15px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component MuteButton inherits Rectangle {
+    in property <bool> muted;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback clicked;
+    width: 34px;
+    height: 34px;
+    border-radius: 17px;
+    background: muted ? Theme.danger-soft : (touch.has-hover ? Theme.surface-sunken : transparent);
+    opacity: enabled ? 1 : 0.4;
+    animate background { duration: Theme.fast; }
+    accessible-role: button;
+    accessible-label: (muted ? "Unmute " : "Mute ") + label;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    SpeakerIcon {
+        muted: root.muted;
+        color: root.muted ? Theme.danger : Theme.text-muted;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component AppRowView inherits Rectangle {
+    in property <AppRow> app;
+    in property <bool> capturing;
+    in property <bool> show-volume;
+    callback toggle();
+    callback capture();
+    callback clear();
+
+    height: 64px;
+    border-radius: 12px;
+    background: hover.has-hover ? Theme.surface-hover : Theme.surface;
+    border-width: 1px;
+    border-color: capturing ? Theme.accent : Theme.border;
+    animate background, border-color { duration: Theme.fast; }
+
+    hover := TouchArea { }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 12px;
+        alignment: stretch;
+
+        VerticalLayout {
+            alignment: center;
+            Avatar { app: root.app; opacity: root.app.running ? 1 : 0.45; }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.app.name;
+                font-size: 13.5px;
+                font-weight: 600;
+                color: root.app.running ? Theme.text : Theme.text-muted;
+                overflow: elide;
+            }
+            Text {
+                text: root.app.subtitle;
+                font-size: 11.5px;
+                color: root.app.muted ? Theme.danger : Theme.text-faint;
+                overflow: elide;
+            }
+            if root.show-volume && root.app.running && root.app.volume >= 0: Rectangle {
+                height: 3px;
+                border-radius: 1.5px;
+                background: Theme.surface-sunken;
+                Rectangle {
+                    x: 0;
+                    width: parent.width * clamp(root.app.volume, 0, 1);
+                    height: parent.height;
+                    border-radius: 1.5px;
+                    background: root.app.muted ? Theme.text-faint : Theme.accent;
+                    animate width { duration: 200ms; }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            ShortcutChip {
+                width: 132px;
+                shortcut: root.app.shortcut;
+                capturing: root.capturing;
+                label: root.app.name + " shortcut";
+                clicked => { root.capture(); }
+                cleared => { root.clear(); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            MuteButton {
+                muted: root.app.muted;
+                enabled: root.app.running;
+                label: root.app.name;
+                clicked => { root.toggle(); }
+            }
+        }
+    }
+}
+
+component MuteAllCard inherits Rectangle {
+    in property <bool> all-muted;
+    in property <int> app-count;
+    in property <string> shortcut;
+    in property <string> restore-shortcut;
+    in property <string> capturing;
+    callback toggle();
+    callback capture(string);
+    callback clear(string);
+
+    border-radius: 18px;
+    background: all-muted
+        ? @linear-gradient(135deg, #ff6b78 0%, #e0405a 100%)
+        : @linear-gradient(135deg, #8a7bff 0%, #5b49f2 100%);
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+    drop-shadow-color: all-muted ? #e0405a40 : #5b49f240;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 14px;
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.all-muted ? "Everything is muted" : "Mute everything";
+                    color: white;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.all-muted
+                        ? "Press again to restore exactly what was playing"
+                        : root.app-count == 1 ? "Instantly silence 1 app" : "Instantly silence " + root.app-count + " apps";
+                    color: #ffffffcc;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+            }
+            Rectangle {
+                width: 46px;
+                height: 46px;
+                border-radius: 23px;
+                background: big.has-hover ? #ffffff : #fffffff0;
+                drop-shadow-blur: 8px;
+                drop-shadow-color: #00000033;
+                accessible-role: button;
+                accessible-label: root.all-muted ? "Restore all apps" : "Mute all apps";
+                accessible-action-default => { root.toggle(); }
+                SpeakerIcon {
+                    width: 22px;
+                    height: 22px;
+                    muted: root.all-muted;
+                    color: root.all-muted ? #e0405a : #5b49f2;
+                }
+                big := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.toggle(); }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text { text: "TOGGLE"; color: #ffffffa6; font-size: 10px; font-weight: 700; letter-spacing: 0.8px; }
+                ShortcutChip {
+                    on-accent: true;
+                    shortcut: root.shortcut;
+                    capturing: root.capturing == "@all";
+                    label: "Mute all shortcut";
+                    clicked => { root.capture("@all"); }
+                    cleared => { root.clear("@all"); }
+                }
+            }
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text { text: "RESTORE (OPTIONAL)"; color: #ffffffa6; font-size: 10px; font-weight: 700; letter-spacing: 0.8px; }
+                ShortcutChip {
+                    on-accent: true;
+                    shortcut: root.restore-shortcut;
+                    placeholder: "Same as toggle";
+                    capturing: root.capturing == "@restore";
+                    label: "Restore all shortcut";
+                    clicked => { root.capture("@restore"); }
+                    cleared => { root.clear("@restore"); }
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "HushKey";
+    icon: root.app-icon;
+    preferred-width: 460px;
+    preferred-height: 660px;
+    min-width: 400px;
+    min-height: 480px;
+    background: Theme.bg;
+    default-font-size: 13px;
+
+    in property <bool> dark: true;
+    in property <image> app-icon;
+    in property <[AppRow]> apps;
+    in property <bool> all-muted;
+    in property <int> running-count;
+    in property <string> mute-all-shortcut;
+    in property <string> restore-shortcut;
+    in property <string> capturing;   // "" | "@all" | "@restore" | app key
+    in property <string> status;
+    in property <bool> status-is-error;
+    in property <string> backend;
+    in property <string> platform-note;
+    in property <bool> show-volume: true;
+    in property <string> config-path;
+    in property <string> version;
+    in property <string> hotkey-hint;
+    in property <bool> launch-on-startup;
+    in property <bool> start-minimized;
+    in property <bool> show-toast: true;
+    in-out property <int> page;
+
+    callback start-capture(string);
+    callback key-captured(string, bool, bool, bool, bool);
+    callback cancel-capture();
+    callback clear-shortcut(string);
+    callback toggle-app(string);
+    callback toggle-all();
+    callback set-launch-on-startup(bool);
+    callback set-start-minimized(bool);
+    callback set-show-toast(bool);
+    callback set-dark(bool);
+    callback open-config-dir();
+    callback refresh();
+    callback dismiss-status();
+
+    init => {
+        Theme.dark = root.dark;
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed dark => {
+        Theme.dark = root.dark;
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    function begin-capture(target: string) {
+        root.start-capture(target);
+        key-sink.focus();
+    }
+
+    // Receives the key combo while a shortcut chip is recording.
+    key-sink := FocusScope {
+        key-pressed(event) => {
+            if (root.capturing != "") {
+                root.key-captured(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta);
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            // ── Header ──────────────────────────────────────────────
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 14px;
+                padding-top: 14px;
+                padding-bottom: 10px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Image { source: root.app-icon; width: 26px; height: 26px; }
+                }
+                Text {
+                    text: "HushKey";
+                    font-size: 17px;
+                    font-weight: 750;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center;
+                    Tabs {
+                        items: ["Apps", "Settings"];
+                        selected <=> root.page;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        tooltip: root.dark ? "Switch to light mode" : "Switch to dark mode";
+                        clicked => { root.set-dark(!root.dark); }
+                        ThemeIcon { dark: root.dark; }
+                    }
+                }
+            }
+
+            // ── Apps page ───────────────────────────────────────────
+            if root.page == 0: VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 4px;
+                spacing: 12px;
+                vertical-stretch: 1;
+
+                MuteAllCard {
+                    all-muted: root.all-muted;
+                    app-count: root.running-count;
+                    shortcut: root.mute-all-shortcut;
+                    restore-shortcut: root.restore-shortcut;
+                    capturing: root.capturing;
+                    toggle => { root.toggle-all(); }
+                    capture(t) => { root.begin-capture(t); }
+                    clear(t) => { root.clear-shortcut(t); }
+                }
+
+                if root.platform-note != "": Rectangle {
+                    border-radius: 10px;
+                    background: Theme.accent-soft;
+                    HorizontalLayout {
+                        padding: 10px;
+                        Text {
+                            text: root.platform-note;
+                            font-size: 12px;
+                            color: Theme.text;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-top: 2px;
+                    SectionLabel { text: "APPLICATIONS"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.capturing != "" ? root.hotkey-hint : (root.running-count + " with audio");
+                        font-size: 11.5px;
+                        color: root.capturing != "" ? Theme.accent : Theme.text-faint;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if root.apps.length == 0: Rectangle {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        SpeakerIcon { width: 30px; height: 30px; color: Theme.text-faint; }
+                        Text {
+                            text: "No apps with audio yet";
+                            font-size: 14px;
+                            font-weight: 600;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Start playing something — it will show up here.";
+                            font-size: 12px;
+                            color: Theme.text-faint;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                if root.apps.length > 0: ListView {
+                    vertical-stretch: 1;
+                    for row in root.apps: VerticalLayout {
+                        padding-bottom: 8px;
+                        padding-right: 12px;   // keep clear of the overlay scrollbar
+                        AppRowView {
+                            app: row;
+                            capturing: root.capturing == row.key;
+                            show-volume: root.show-volume;
+                            toggle => { root.toggle-app(row.key); }
+                            capture => { root.begin-capture(row.key); }
+                            clear => { root.clear-shortcut(row.key); }
+                        }
+                    }
+                }
+            }
+
+            // ── Settings page ───────────────────────────────────────
+            if root.page == 1: ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    padding-top: 4px;
+                    padding-bottom: 16px;
+                    spacing: 10px;
+                    alignment: start;
+
+                    SectionLabel { text: "GENERAL"; }
+                    Card {
+                        VerticalLayout {
+                            SettingRow {
+                                title: "Launch at login";
+                                subtitle: "Start HushKey in the tray when you sign in.";
+                                Switch {
+                                    label: "Launch at login";
+                                    checked: root.launch-on-startup;
+                                    toggled(v) => { root.set-launch-on-startup(v); }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.border; }
+                            SettingRow {
+                                title: "Start minimized";
+                                subtitle: "Open straight to the tray instead of showing this window.";
+                                Switch {
+                                    label: "Start minimized";
+                                    checked: root.start-minimized;
+                                    toggled(v) => { root.set-start-minimized(v); }
+                                }
+                            }
+                            Rectangle { height: 1px; background: Theme.border; }
+                            SettingRow {
+                                title: "On-screen confirmation";
+                                subtitle: "Show a small popup when a shortcut mutes or unmutes something.";
+                                Switch {
+                                    label: "On-screen confirmation";
+                                    checked: root.show-toast;
+                                    toggled(v) => { root.set-show-toast(v); }
+                                }
+                            }
+                        }
+                    }
+
+                    SectionLabel { text: "APPEARANCE"; }
+                    Card {
+                        SettingRow {
+                            title: "Theme";
+                            Tabs {
+                                items: ["Dark", "Light"];
+                                selected: root.dark ? 0 : 1;
+                                changed selected => { root.set-dark(self.selected == 0); }
+                            }
+                        }
+                    }
+
+                    SectionLabel { text: "ABOUT"; }
+                    Card {
+                        VerticalLayout {
+                            padding: 16px;
+                            spacing: 6px;
+                            Text {
+                                text: "HushKey " + root.version;
+                                font-size: 14px;
+                                font-weight: 700;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: "Audio backend: " + root.backend;
+                                font-size: 12px;
+                                color: Theme.text-muted;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Settings file: " + root.config-path;
+                                font-size: 12px;
+                                color: Theme.text-muted;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                padding-top: 4px;
+                                Rectangle {
+                                    height: 30px;
+                                    border-radius: 8px;
+                                    background: open.has-hover ? Theme.surface-hover : Theme.surface-sunken;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    accessible-role: button;
+                                    accessible-label: "Open settings folder";
+                                    accessible-action-default => { root.open-config-dir(); }
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        Text { text: "Open settings folder"; font-size: 12px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                                    }
+                                    open := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.open-config-dir(); }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "MIT License · Built with Slint (slint.dev) · Created using Claude Opus 5.5";
+                                font-size: 11px;
+                                color: Theme.text-faint;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Status banner ───────────────────────────────────────
+            if root.status != "": HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-bottom: 12px;
+                Rectangle {
+                    border-radius: 10px;
+                    background: root.status-is-error ? Theme.danger-soft : Theme.accent-soft;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 6px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 8px;
+                        Text {
+                            text: root.status;
+                            font-size: 12px;
+                            color: Theme.text;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        IconButton {
+                            width: 26px;
+                            height: 26px;
+                            tooltip: "Dismiss";
+                            clicked => { root.dismiss-status(); }
+                            Path {
+                                width: 10px;
+                                height: 10px;
+                                viewbox-width: 10;
+                                viewbox-height: 10;
+                                commands: "M1 1l8 8 M9 1l-8 8";
+                                stroke: Theme.text-muted;
+                                stroke-width: 1.5px;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

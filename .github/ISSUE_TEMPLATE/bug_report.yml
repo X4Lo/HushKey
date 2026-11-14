@@ -1,0 +1,47 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "Windows 11 23H2 / macOS 15.1 (Apple Silicon) / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: linux-session
+    attributes:
+      label: "Linux only: session, desktop and audio server"
+      placeholder: "wayland, GNOME 46, PipeWire (pactl info | grep 'Server Name')"
+  - type: input
+    id: version
+    attributes:
+      label: HushKey version
+      description: Settings → About
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you pressed, what you expected, what actually happened. Mention your keyboard layout for shortcut issues.
+    validations:
+      required: true
+  - type: textarea
+    id: list
+    attributes:
+      label: Output of `hushkey --list`
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (`RUST_LOG=hushkey=debug`)
+      render: text

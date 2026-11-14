@@ -1,0 +1,69 @@
+[package]
+name = "hushkey"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Global hotkeys to instantly mute/unmute individual apps — or everything at once."
+license = "MIT"
+repository = "https://github.com/X4Lo/HushKey"
+readme = "README.md"
+keywords = ["audio", "mute", "hotkey", "tray", "volume"]
+categories = ["multimedia::audio", "gui"]
+build = "build.rs"
+
+[dependencies]
+# UI: native Rust toolkit, software renderer (no GPU context, no webview).
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+    "accessibility",
+    "unstable-winit-030",
+] }
+
+global-hotkey = "0.10"
+tray-icon = { version = "0.26", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+directories = "6"
+auto-launch = "0.6"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSValue", "NSString"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.30"
+# Pure-Rust StatusNotifierItem tray over D-Bus: no GTK main loop needed.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
+[build-dependencies]
+slint-build = "1.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 1
