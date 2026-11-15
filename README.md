@@ -13,7 +13,7 @@ Bind global shortcuts to individual applications' audio and toggle them instantl
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-orange)
 
-<img src="docs/assets/main-window.webp" alt="HushKey main window" width="460">
+<img src="docs/assets/main-window.webp" alt="HushKey main window">
 
 </div>
 
