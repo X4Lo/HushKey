@@ -1,6 +1,6 @@
 [package]
 name = "hushkey"
-version = "1.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Global hotkeys to instantly mute/unmute individual apps — or everything at once."
