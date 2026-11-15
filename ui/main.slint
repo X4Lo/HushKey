@@ -1,7 +1,8 @@
 import { ListView, ScrollView, Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import {
-    SpeakerIcon, ThemeIcon, IconButton, Tabs, Switch, ShortcutChip, SettingRow, Card, SectionLabel
+    SpeakerIcon, ThemeIcon, IconButton, Tabs, Switch, ShortcutChip, SettingRow, Card, SectionLabel,
+    VolumeSlider, DevicePicker
 } from "widgets.slint";
 
 export { Toast } from "toast.slint";
@@ -18,6 +19,8 @@ export struct AppRow {
     muted: bool,
     volume: float,      // 0..1, < 0 when unknown
     shortcut: string,   // display label, "" when unbound
+    routable: bool,     // output device can be changed
+    device-index: int,  // index into MainWindow.app-device-options (0 = system default)
 }
 
 component Avatar inherits Rectangle {
@@ -71,11 +74,17 @@ component AppRowView inherits Rectangle {
     in property <AppRow> app;
     in property <bool> capturing;
     in property <bool> show-volume;
+    in property <bool> show-device;
+    in property <[string]> device-options;
     callback toggle();
     callback capture();
     callback clear();
+    callback volume-moved(float);
+    callback device-picked(int);
 
-    height: 64px;
+    property <bool> has-volume: show-volume && app.running && app.volume >= 0;
+    property <bool> has-device: show-device && app.running && app.routable;
+
     border-radius: 12px;
     background: hover.has-hover ? Theme.surface-hover : Theme.surface;
     border-width: 1px;
@@ -84,65 +93,164 @@ component AppRowView inherits Rectangle {
 
     hover := TouchArea { }
 
-    HorizontalLayout {
+    VerticalLayout {
         padding-left: 12px;
         padding-right: 10px;
-        spacing: 12px;
-        alignment: stretch;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 8px;
 
-        VerticalLayout {
-            alignment: center;
-            Avatar { app: root.app; opacity: root.app.running ? 1 : 0.45; }
-        }
-        VerticalLayout {
-            alignment: center;
-            spacing: 3px;
-            horizontal-stretch: 1;
-            Text {
-                text: root.app.name;
-                font-size: 13.5px;
-                font-weight: 600;
-                color: root.app.running ? Theme.text : Theme.text-muted;
-                overflow: elide;
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: stretch;
+
+            VerticalLayout {
+                alignment: center;
+                Avatar { app: root.app; opacity: root.app.running ? 1 : 0.45; }
             }
-            Text {
-                text: root.app.subtitle;
-                font-size: 11.5px;
-                color: root.app.muted ? Theme.danger : Theme.text-faint;
-                overflow: elide;
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.app.name;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    color: root.app.running ? Theme.text : Theme.text-muted;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.app.subtitle;
+                    font-size: 11.5px;
+                    color: root.app.muted ? Theme.danger : Theme.text-faint;
+                    overflow: elide;
+                }
             }
-            if root.show-volume && root.app.running && root.app.volume >= 0: Rectangle {
-                height: 3px;
-                border-radius: 1.5px;
-                background: Theme.surface-sunken;
-                Rectangle {
-                    x: 0;
-                    width: parent.width * clamp(root.app.volume, 0, 1);
-                    height: parent.height;
-                    border-radius: 1.5px;
-                    background: root.app.muted ? Theme.text-faint : Theme.accent;
-                    animate width { duration: 200ms; }
+            VerticalLayout {
+                alignment: center;
+                ShortcutChip {
+                    width: 132px;
+                    shortcut: root.app.shortcut;
+                    capturing: root.capturing;
+                    label: root.app.name + " shortcut";
+                    clicked => { root.capture(); }
+                    cleared => { root.clear(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                MuteButton {
+                    muted: root.app.muted;
+                    enabled: root.app.running;
+                    label: root.app.name;
+                    clicked => { root.toggle(); }
                 }
             }
         }
-        VerticalLayout {
+
+        if root.has-volume || root.has-device: HorizontalLayout {
+            padding-left: 48px;   // line up with the name, past the avatar
+            padding-right: 2px;
+            spacing: 10px;
+            if root.has-volume: VolumeSlider {
+                horizontal-stretch: 1;
+                value: root.app.volume;
+                dimmed: root.app.muted;
+                label: root.app.name + " volume";
+                moved(v) => { root.volume-moved(v); }
+            }
+            if root.has-volume: Text {
+                width: 34px;
+                text: round(root.app.volume * 100) + "%";
+                font-size: 11.5px;
+                color: Theme.text-muted;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+            if !root.has-volume: Rectangle { horizontal-stretch: 1; }
+            if root.has-device: DevicePicker {
+                width: 150px;
+                options: root.device-options;
+                selected: root.app.device-index;
+                label: root.app.name + " output device";
+                picked(i) => { root.device-picked(i); }
+            }
+        }
+    }
+}
+
+// System volume + default output device.
+component OutputCard inherits Rectangle {
+    in property <float> volume;            // 0..1, < 0 when the device has no volume control
+    in property <bool> muted;
+    in property <bool> show-volume;
+    in property <bool> show-device;
+    in property <[string]> devices;
+    in property <int> device-index;
+    callback toggle-mute();
+    callback volume-moved(float);
+    callback device-picked(int);
+
+    property <bool> has-volume: show-volume && volume >= 0;
+
+    border-radius: 12px;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 12px;
+
+        if root.show-volume: VerticalLayout {
             alignment: center;
-            ShortcutChip {
-                width: 132px;
-                shortcut: root.app.shortcut;
-                capturing: root.capturing;
-                label: root.app.name + " shortcut";
-                clicked => { root.capture(); }
-                cleared => { root.clear(); }
+            MuteButton {
+                muted: root.muted;
+                label: "system volume";
+                clicked => { root.toggle-mute(); }
             }
         }
         VerticalLayout {
             alignment: center;
-            MuteButton {
-                muted: root.app.muted;
-                enabled: root.app.running;
-                label: root.app.name;
-                clicked => { root.toggle(); }
+            spacing: 4px;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                Text {
+                    text: "System volume";
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Theme.text;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.muted ? "Muted" : (root.has-volume ? round(root.volume * 100) + "%" : "");
+                    font-size: 11.5px;
+                    color: root.muted ? Theme.danger : Theme.text-muted;
+                }
+            }
+            if root.has-volume: VolumeSlider {
+                value: root.volume;
+                dimmed: root.muted;
+                label: "System volume";
+                moved(v) => { root.volume-moved(v); }
+            }
+            if !root.has-volume && root.show-volume: Text {
+                text: "This device has no volume control";
+                font-size: 11.5px;
+                color: Theme.text-faint;
+            }
+        }
+        if root.show-device: VerticalLayout {
+            alignment: center;
+            DevicePicker {
+                width: 160px;
+                options: root.devices;
+                selected: root.device-index;
+                label: "Output device";
+                picked(i) => { root.device-picked(i); }
             }
         }
     }
@@ -248,8 +356,8 @@ component MuteAllCard inherits Rectangle {
 export component MainWindow inherits Window {
     title: "HushKey";
     icon: root.app-icon;
-    preferred-width: 460px;
-    preferred-height: 660px;
+    preferred-width: 480px;
+    preferred-height: 720px;
     min-width: 400px;
     min-height: 480px;
     background: Theme.bg;
@@ -268,6 +376,14 @@ export component MainWindow inherits Window {
     in property <string> backend;
     in property <string> platform-note;
     in property <bool> show-volume: true;
+    in property <bool> show-app-device;
+    in property <bool> show-master-volume;
+    in property <bool> show-output-devices;
+    in property <[string]> output-devices;        // names, for the system picker
+    in property <[string]> app-device-options;    // "System default" + names
+    in property <int> default-device-index;
+    in property <float> master-volume: -1;
+    in property <bool> master-muted;
     in property <string> config-path;
     in property <string> version;
     in property <string> hotkey-hint;
@@ -289,6 +405,12 @@ export component MainWindow inherits Window {
     callback open-config-dir();
     callback refresh();
     callback dismiss-status();
+    callback set-app-volume(string, float);
+    callback pick-app-device(string, int);
+    callback set-master-volume(float);
+    callback toggle-master-mute();
+    callback pick-default-device(int);
+    callback open-url(string);
 
     init => {
         Theme.dark = root.dark;
@@ -370,6 +492,18 @@ export component MainWindow inherits Window {
                     clear(t) => { root.clear-shortcut(t); }
                 }
 
+                if root.show-master-volume || root.show-output-devices: OutputCard {
+                    volume: root.master-volume;
+                    muted: root.master-muted;
+                    show-volume: root.show-master-volume;
+                    show-device: root.show-output-devices;
+                    devices: root.output-devices;
+                    device-index: root.default-device-index;
+                    toggle-mute => { root.toggle-master-mute(); }
+                    volume-moved(v) => { root.set-master-volume(v); }
+                    device-picked(i) => { root.pick-default-device(i); }
+                }
+
                 if root.platform-note != "": Rectangle {
                     border-radius: 10px;
                     background: Theme.accent-soft;
@@ -427,7 +561,11 @@ export component MainWindow inherits Window {
                             app: row;
                             capturing: root.capturing == row.key;
                             show-volume: root.show-volume;
+                            show-device: root.show-app-device;
+                            device-options: root.app-device-options;
                             toggle => { root.toggle-app(row.key); }
+                            volume-moved(v) => { root.set-app-volume(row.key, v); }
+                            device-picked(i) => { root.pick-app-device(row.key, i); }
                             capture => { root.begin-capture(row.key); }
                             clear => { root.clear-shortcut(row.key); }
                         }
@@ -498,11 +636,22 @@ export component MainWindow inherits Window {
                         VerticalLayout {
                             padding: 16px;
                             spacing: 6px;
-                            Text {
-                                text: "HushKey " + root.version;
-                                font-size: 14px;
-                                font-weight: 700;
-                                color: Theme.text;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Text {
+                                    text: "HushKey " + root.version;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "by X4Lo";
+                                    font-size: 12.5px;
+                                    color: Theme.text-muted;
+                                    vertical-alignment: center;
+                                }
                             }
                             Text {
                                 text: "Audio backend: " + root.backend;
@@ -519,6 +668,26 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 alignment: start;
                                 padding-top: 4px;
+                                spacing: 8px;
+                                Rectangle {
+                                    height: 30px;
+                                    border-radius: 8px;
+                                    background: gh.has-hover ? Theme.surface-hover : Theme.surface-sunken;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    accessible-role: button;
+                                    accessible-label: "Open HushKey on GitHub";
+                                    accessible-action-default => { root.open-url("https://github.com/X4Lo/HushKey"); }
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        Text { text: "GitHub ↗"; font-size: 12px; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+                                    }
+                                    gh := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.open-url("https://github.com/X4Lo/HushKey"); }
+                                    }
+                                }
                                 Rectangle {
                                     height: 30px;
                                     border-radius: 8px;
@@ -540,7 +709,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text {
-                                text: "MIT License · Built with Slint (slint.dev) · Created using Claude Opus 5.5";
+                                text: "github.com/X4Lo/HushKey · MIT License · Built with Slint (slint.dev)";
                                 font-size: 11px;
                                 color: Theme.text-faint;
                                 wrap: word-wrap;

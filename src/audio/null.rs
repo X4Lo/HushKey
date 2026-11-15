@@ -22,6 +22,8 @@ impl NullController {
                     volume: Some(1.0),
                     muted: *muted,
                     exe_path: None,
+                    device: None,
+                    routable: true,
                 })
                 .collect(),
             mute_calls: 0,
@@ -39,7 +41,7 @@ impl AudioController for NullController {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { per_app_volume: true, per_app_mute: true }
+        Capabilities { per_app_volume: true, per_app_mute: true, ..Capabilities::default() }
     }
 
     fn list_audio_apps(&mut self) -> AudioResult<Vec<AudioApp>> {

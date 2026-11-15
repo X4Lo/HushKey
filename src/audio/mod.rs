@@ -5,16 +5,19 @@
 //! (see [`worker`]) so they may hold thread-affine handles (COM objects, the
 //! PulseAudio mainloop, CoreAudio taps) without being `Send`.
 //!
-//! | OS      | Mechanism                                   | Per-app volume | Per-app mute |
-//! |---------|---------------------------------------------|----------------|--------------|
-//! | Windows | WASAPI `IAudioSessionManager2` sessions     | yes            | yes          |
-//! | Linux   | PulseAudio / PipeWire-pulse sink inputs     | yes            | yes          |
-//! | macOS   | Core Audio process taps (macOS 14.2+)       | **no**         | yes          |
+//! | OS      | Mechanism                               | Per-app volume | Per-app mute | Per-app device |
+//! |---------|-----------------------------------------|----------------|--------------|----------------|
+//! | Windows | WASAPI `IAudioSessionManager2` sessions | yes            | yes          | yes            |
+//! | Linux   | PulseAudio / PipeWire-pulse sink inputs | yes            | yes          | yes            |
+//! | macOS   | Core Audio process taps (macOS 14.2+)   | **no**         | yes          | **no**         |
 //!
-//! macOS has no public API for setting another process's volume. HushKey mutes an
-//! app by creating a *muted process tap* on it, which silences that process while
+//! System volume, system mute and switching the default output device work on all three.
+//!
+//! macOS has no public API for setting another process's volume or output device. HushKey
+//! mutes an app by creating a *muted process tap* on it, which silences that process while
 //! the tap exists. Arbitrary volume levels are not possible — the backend reports
-//! `per_app_volume: false` and the UI hides volume levels instead of faking them.
+//! `per_app_volume: false` / `per_app_device: false` and the UI hides those controls
+//! instead of faking them.
 
 mod mute;
 pub mod worker;
@@ -55,12 +58,39 @@ pub struct AudioApp {
     pub muted: bool,
     /// Executable path for icon lookup, when known.
     pub exe_path: Option<PathBuf>,
+    /// [`OutputDevice::id`] this app is explicitly routed to; `None` = follows the system default.
+    pub device: Option<String>,
+    /// Whether this app's output device can be changed (false for e.g. Windows system sounds).
+    pub routable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An active playback device (speakers, headphones, HDMI, virtual cable…).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDevice {
+    /// Backend-specific stable id (MMDevice id, PulseAudio sink name, Core Audio UID).
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Volume and mute of the system default output device.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MasterVolume {
+    /// 0.0..=1.0. `None` when the device has no volume control (some HDMI/USB outputs).
+    pub volume: Option<f32>,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
     pub per_app_volume: bool,
     pub per_app_mute: bool,
+    /// Per-app output device routing.
+    pub per_app_device: bool,
+    /// System volume / mute of the default output device.
+    pub master_volume: bool,
+    /// Listing output devices and switching the system default.
+    pub output_devices: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +98,6 @@ pub enum AudioError {
     /// No running app has this key right now.
     NotRunning(AppKey),
     /// The platform can't do this (see the capability table above).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Unsupported(&'static str),
     /// The OS needs a permission the user hasn't granted (macOS audio capture).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -115,10 +144,7 @@ pub trait AudioController {
     /// idle ones that aren't currently producing sound. One entry per [`AppKey`].
     fn list_audio_apps(&mut self) -> AudioResult<Vec<AudioApp>>;
 
-    /// Set the volume of every session of `app` (0.0..=1.0).
-    /// Part of the backend contract (and `--list` diagnostics); the UI currently toggles
-    /// mute only, which preserves the user's own level in the OS mixer.
-    #[allow(dead_code)]
+    /// Set the volume of every session of `app` (0.0..=1.0). Independent of the mute flag.
     fn set_app_volume(&mut self, app: &str, volume: f32) -> AudioResult<()>;
 
     /// Mute/unmute every session of `app`. Uses the OS mixer's own mute flag, so the
@@ -149,6 +175,34 @@ pub trait AudioController {
             }
         }
         Ok(())
+    }
+
+    /// Active output devices, default first is *not* guaranteed (check `is_default`).
+    fn output_devices(&mut self) -> AudioResult<Vec<OutputDevice>> {
+        Ok(Vec::new())
+    }
+
+    /// Make `id` the system default output device.
+    fn set_default_output_device(&mut self, _id: &str) -> AudioResult<()> {
+        Err(AudioError::Unsupported("switching the output device"))
+    }
+
+    /// Volume / mute of the default output device.
+    fn master_volume(&mut self) -> AudioResult<MasterVolume> {
+        Err(AudioError::Unsupported("system volume"))
+    }
+
+    fn set_master_volume(&mut self, _volume: f32) -> AudioResult<()> {
+        Err(AudioError::Unsupported("system volume"))
+    }
+
+    fn set_master_mute(&mut self, _muted: bool) -> AudioResult<()> {
+        Err(AudioError::Unsupported("system mute"))
+    }
+
+    /// Route every stream of `app` to `device`, or back to the system default with `None`.
+    fn set_app_output_device(&mut self, _app: &str, _device: Option<&str>) -> AudioResult<()> {
+        Err(AudioError::Unsupported("per-app output devices"))
     }
 
     /// Best-effort app icon. Default: none (UI shows a letter avatar).

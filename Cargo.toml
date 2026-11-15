@@ -1,6 +1,6 @@
 [package]
 name = "hushkey"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Global hotkeys to instantly mute/unmute individual apps — or everything at once."
@@ -32,9 +32,16 @@ log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# windows-core is needed directly by the `#[interface]` macro (private policy-config COM interfaces).
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",

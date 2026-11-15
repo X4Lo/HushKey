@@ -106,9 +106,31 @@ fn list_apps() {
         Ok(apps) => {
             for a in apps {
                 let vol = a.volume.map(|v| format!("{:>3.0}%", v * 100.0)).unwrap_or_else(|| "  — ".into());
-                println!("{:<32} {:<28} vol {vol}  muted {:<5}  pids {:?}", a.key, a.name, a.muted, a.pids);
+                let dev = a.device.as_deref().unwrap_or("default");
+                println!(
+                    "{:<32} {:<28} vol {vol}  muted {:<5}  pids {:?}  device {dev}",
+                    a.key, a.name, a.muted, a.pids
+                );
             }
         }
         Err(e) => eprintln!("error: {e}"),
+    }
+    if let Ok(m) = ctl.master_volume() {
+        let vol = m.volume.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "—".into());
+        println!(
+            "
+system volume {vol}  muted {}",
+            m.muted
+        );
+    }
+    match ctl.output_devices() {
+        Ok(devices) if !devices.is_empty() => {
+            println!("output devices:");
+            for d in devices {
+                println!("  {} {:<36} {}", if d.is_default { "*" } else { " " }, d.name, d.id);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("output devices: {e}"),
     }
 }

@@ -30,7 +30,7 @@ const BOTTOM_MARGIN: f64 = 110.0;
 /// Window-attribute hook: applied to every winit window Slint creates.
 pub fn window_attributes_hook(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
     if !NEXT_WINDOW_IS_TOAST.with(|f| f.replace(false)) {
-        return attrs;
+        return super::with_app_icons(attrs);
     }
     let attrs = attrs
         .with_active(false)

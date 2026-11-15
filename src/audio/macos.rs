@@ -11,6 +11,9 @@
 //!
 //! Consequences:
 //! - Per-app **mute works**; per-app **volume levels do not** (`per_app_volume: false`).
+//! - Per-app **output devices do not** either (`per_app_device: false`): there is no
+//!   public API to reroute another process. System volume/mute (the default device's
+//!   virtual main volume) and switching the default output device are public and supported.
 //!   `set_app_volume` accepts only 0.0 (mute) and 1.0 (unmute) and reports `Unsupported`
 //!   for anything in between — it never fakes a level.
 //! - Requires macOS 14.2+. On older systems the symbols are absent; we look them up with
@@ -25,7 +28,7 @@
 //! **Untested on real hardware by the original author** (developed on Windows, compile-
 //! checked for `aarch64-apple-darwin`). Reports from macOS users are very welcome.
 
-use super::{AudioApp, AudioController, AudioError, AudioResult, Capabilities};
+use super::{AudioApp, AudioController, AudioError, AudioResult, Capabilities, MasterVolume, OutputDevice};
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
@@ -55,6 +58,16 @@ const K_HW_PROCESS_OBJECT_LIST: u32 = fourcc(b"prs#");
 const K_PROCESS_PID: u32 = fourcc(b"ppid");
 const K_PROCESS_BUNDLE_ID: u32 = fourcc(b"pbid");
 const K_PROCESS_IS_RUNNING_OUTPUT: u32 = fourcc(b"piro");
+const K_SCOPE_OUTPUT: u32 = fourcc(b"outp");
+const K_HW_DEVICES: u32 = fourcc(b"dev#");
+const K_HW_DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
+const K_DEVICE_STREAMS: u32 = fourcc(b"stm#");
+const K_DEVICE_UID: u32 = fourcc(b"uid ");
+const K_OBJECT_NAME: u32 = fourcc(b"lnam");
+const K_DEVICE_VOLUME_SCALAR: u32 = fourcc(b"volm");
+const K_DEVICE_MUTE: u32 = fourcc(b"mute");
+/// `kAudioHardwareServiceDeviceProperty_VirtualMainVolume` (the menu-bar volume).
+const K_VIRTUAL_MAIN_VOLUME: u32 = fourcc(b"vmvc");
 /// `CATapMuteBehavior.CATapMuted`
 const CA_TAP_MUTED: isize = 1;
 
@@ -74,6 +87,35 @@ extern "C" {
         qualifier: *const c_void,
         io_size: *mut u32,
         out: *mut c_void,
+    ) -> OSStatus;
+    fn AudioObjectSetPropertyData(
+        id: AudioObjectID,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        data_size: u32,
+        data: *const c_void,
+    ) -> OSStatus;
+}
+
+// The virtual main volume is only served through the AudioHardwareService shim.
+#[link(name = "AudioToolbox", kind = "framework")]
+extern "C" {
+    fn AudioHardwareServiceGetPropertyData(
+        id: AudioObjectID,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        io_size: *mut u32,
+        out: *mut c_void,
+    ) -> OSStatus;
+    fn AudioHardwareServiceSetPropertyData(
+        id: AudioObjectID,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        data_size: u32,
+        data: *const c_void,
     ) -> OSStatus;
 }
 
@@ -201,7 +243,13 @@ impl AudioController for CoreAudioTapController {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { per_app_volume: false, per_app_mute: self.api.is_some() }
+        Capabilities {
+            per_app_volume: false,
+            per_app_mute: self.api.is_some(),
+            per_app_device: false,
+            master_volume: true,
+            output_devices: true,
+        }
     }
 
     fn list_audio_apps(&mut self) -> AudioResult<Vec<AudioApp>> {
@@ -245,6 +293,8 @@ impl AudioController for CoreAudioTapController {
                 pids: ps.iter().map(|p| p.pid).collect(),
                 volume: None, // not readable per-app on macOS
                 exe_path: ps[0].path.clone(),
+                device: None,
+                routable: false,
                 key,
             })
             .collect::<Vec<_>>();
@@ -282,10 +332,70 @@ impl AudioController for CoreAudioTapController {
         Ok(())
     }
 
+    fn output_devices(&mut self) -> AudioResult<Vec<OutputDevice>> {
+        let default = default_output_device();
+        let ids: Vec<AudioObjectID> = unsafe { get_array(K_AUDIO_OBJECT_SYSTEM_OBJECT, K_HW_DEVICES)? };
+        let mut out = Vec::new();
+        for id in ids {
+            if !has_output_streams(id) {
+                continue;
+            }
+            let Some(uid) = (unsafe { get_cfstring(id, K_DEVICE_UID) }) else { continue };
+            let name = unsafe { get_cfstring(id, K_OBJECT_NAME) }.unwrap_or_else(|| uid.clone());
+            out.push(OutputDevice { id: uid, name, is_default: Some(id) == default });
+        }
+        out.sort_by_key(|d| d.name.to_lowercase());
+        Ok(out)
+    }
+
+    fn set_default_output_device(&mut self, uid: &str) -> AudioResult<()> {
+        let ids: Vec<AudioObjectID> = unsafe { get_array(K_AUDIO_OBJECT_SYSTEM_OBJECT, K_HW_DEVICES)? };
+        let id = ids
+            .into_iter()
+            .find(|id| unsafe { get_cfstring(*id, K_DEVICE_UID) }.as_deref() == Some(uid))
+            .ok_or_else(|| AudioError::Backend("that output device is gone".into()))?;
+        let a = addr(K_HW_DEFAULT_OUTPUT_DEVICE);
+        let status = unsafe {
+            AudioObjectSetPropertyData(K_AUDIO_OBJECT_SYSTEM_OBJECT, &a, 0, std::ptr::null(), 4, &id as *const u32 as _)
+        };
+        check(status, "set default output device")
+    }
+
+    fn master_volume(&mut self) -> AudioResult<MasterVolume> {
+        let dev = default_output_device().ok_or_else(|| AudioError::Backend("no output device".into()))?;
+        let volume = unsafe { service_get::<f32>(dev, output_addr(K_VIRTUAL_MAIN_VOLUME)) }
+            .or_else(|| unsafe { get_at::<f32>(dev, output_addr(K_DEVICE_VOLUME_SCALAR)) });
+        let muted = unsafe { get_at::<u32>(dev, output_addr(K_DEVICE_MUTE)) }.unwrap_or(0) != 0;
+        Ok(MasterVolume { volume, muted })
+    }
+
+    fn set_master_volume(&mut self, volume: f32) -> AudioResult<()> {
+        let dev = default_output_device().ok_or_else(|| AudioError::Backend("no output device".into()))?;
+        let v = volume.clamp(0.0, 1.0);
+        let a = output_addr(K_VIRTUAL_MAIN_VOLUME);
+        let status =
+            unsafe { AudioHardwareServiceSetPropertyData(dev, &a, 0, std::ptr::null(), 4, &v as *const f32 as _) };
+        if status == 0 {
+            return Ok(());
+        }
+        let a = output_addr(K_DEVICE_VOLUME_SCALAR);
+        check(
+            unsafe { AudioObjectSetPropertyData(dev, &a, 0, std::ptr::null(), 4, &v as *const f32 as _) },
+            "set volume",
+        )
+    }
+
+    fn set_master_mute(&mut self, muted: bool) -> AudioResult<()> {
+        let dev = default_output_device().ok_or_else(|| AudioError::Backend("no output device".into()))?;
+        let m = muted as u32;
+        let a = output_addr(K_DEVICE_MUTE);
+        check(unsafe { AudioObjectSetPropertyData(dev, &a, 0, std::ptr::null(), 4, &m as *const u32 as _) }, "set mute")
+    }
+
     fn platform_note(&self) -> Option<&'static str> {
         Some(if self.api.is_some() {
-            "macOS can mute individual apps but can't set their volume level. Muting needs the \
-             Screen & System Audio Recording permission."
+            "macOS can mute individual apps but can't set their volume level or output device. \
+             Muting needs the Screen & System Audio Recording permission."
         } else {
             "Per-app muting needs macOS 14.2 or newer. Apps are listed read-only."
         })
@@ -324,6 +434,52 @@ fn pid_path(pid: i32) -> Option<PathBuf> {
 
 fn addr(selector: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress { selector, scope: K_SCOPE_GLOBAL, element: K_ELEMENT_MAIN }
+}
+
+fn output_addr(selector: u32) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress { selector, scope: K_SCOPE_OUTPUT, element: K_ELEMENT_MAIN }
+}
+
+fn check(status: OSStatus, what: &str) -> AudioResult<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(AudioError::Backend(format!("{what}: OSStatus {status}")))
+    }
+}
+
+fn default_output_device() -> Option<AudioObjectID> {
+    unsafe { get_scalar::<AudioObjectID>(K_AUDIO_OBJECT_SYSTEM_OBJECT, K_HW_DEFAULT_OUTPUT_DEVICE) }
+        .filter(|id| *id != 0)
+}
+
+fn has_output_streams(id: AudioObjectID) -> bool {
+    let a = output_addr(K_DEVICE_STREAMS);
+    let mut size = 0u32;
+    let status = unsafe { AudioObjectGetPropertyDataSize(id, &a, 0, std::ptr::null(), &mut size) };
+    status == 0 && size > 0
+}
+
+unsafe fn get_at<T: Copy + Default>(object: AudioObjectID, a: AudioObjectPropertyAddress) -> Option<T> {
+    let mut v = T::default();
+    let mut size = std::mem::size_of::<T>() as u32;
+    let status =
+        AudioObjectGetPropertyData(object, &a, 0, std::ptr::null(), &mut size, &mut v as *mut T as *mut c_void);
+    (status == 0).then_some(v)
+}
+
+unsafe fn service_get<T: Copy + Default>(object: AudioObjectID, a: AudioObjectPropertyAddress) -> Option<T> {
+    let mut v = T::default();
+    let mut size = std::mem::size_of::<T>() as u32;
+    let status = AudioHardwareServiceGetPropertyData(
+        object,
+        &a,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut v as *mut T as *mut c_void,
+    );
+    (status == 0).then_some(v)
 }
 
 unsafe fn get_array<T: Copy + Default>(object: AudioObjectID, selector: u32) -> AudioResult<Vec<T>> {

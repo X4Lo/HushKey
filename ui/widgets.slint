@@ -258,3 +258,194 @@ export component SectionLabel inherits Text {
     letter-spacing: 0.8px;
     color: Theme.text-faint;
 }
+
+// Horizontal volume slider. `value` comes from Rust; while dragging the knob follows the
+// pointer locally, so periodic refreshes never make it jump under the user's finger.
+export component VolumeSlider inherits Rectangle {
+    in property <float> value;        // 0..1
+    in property <bool> enabled: true;
+    in property <bool> dimmed;        // muted: grey fill
+    in property <string> label;
+    callback moved(float);            // 0..1, fires continuously while dragging
+
+    property <float> drag-value;
+    property <float> shown: touch.pressed ? drag-value : clamp(value, 0, 1);
+    property <length> knob: 14px;
+
+    height: 22px;
+    min-width: 60px;
+    opacity: enabled ? 1 : 0.4;
+
+    accessible-role: slider;
+    accessible-label: label;
+    accessible-value: round(root.shown * 100) + "%";
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value-step: 5;
+    accessible-action-increment => { root.moved(min(1, root.value + 0.05)); }
+    accessible-action-decrement => { root.moved(max(0, root.value - 0.05)); }
+
+    function set-from(x: length) {
+        root.drag-value = clamp((x - root.knob / 2) / max(1px, root.width - root.knob), 0, 1);
+        root.moved(root.drag-value);
+    }
+
+    Rectangle {
+        y: (parent.height - 4px) / 2;
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.border;
+    }
+    Rectangle {
+        x: 0;
+        y: (parent.height - 4px) / 2;
+        height: 4px;
+        width: (root.width - root.knob) * root.shown + root.knob / 2;
+        border-radius: 2px;
+        background: root.dimmed ? Theme.text-faint : Theme.accent;
+    }
+    Rectangle {
+        x: (root.width - root.knob) * root.shown;
+        y: (parent.height - root.knob) / 2;
+        width: root.knob;
+        height: root.knob;
+        border-radius: root.knob / 2;
+        background: white;
+        border-width: 1px;
+        border-color: touch.has-hover || touch.pressed ? (root.dimmed ? Theme.text-faint : Theme.accent) : Theme.border-strong;
+        drop-shadow-blur: 3px;
+        drop-shadow-color: #00000040;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.set-from(self.mouse-x);
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.set-from(self.mouse-x);
+            }
+        }
+        scroll-event(e) => {
+            if (e.delta-y == 0) {
+                return reject;
+            }
+            root.moved(clamp(root.value + (e.delta-y > 0 ? 0.05 : -0.05), 0, 1));
+            accept
+        }
+    }
+}
+
+// Compact drop-down: shows the selected option, opens a themed popup list.
+export component DevicePicker inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;       // index into options, -1 = none
+    in property <string> label;       // accessibility label
+    in property <bool> enabled: true;
+    in property <length> popup-width: 260px;
+    callback picked(int);
+
+    property <string> current: selected >= 0 && selected < options.length ? options[selected] : "—";
+
+    height: 28px;
+    min-width: 80px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: touch.has-hover ? Theme.surface-hover : Theme.surface-sunken;
+    opacity: enabled ? 1 : 0.5;
+    animate background { duration: Theme.fast; }
+
+    accessible-role: combobox;
+    accessible-label: label;
+    accessible-value: current;
+    accessible-action-default => { if (root.enabled) { popup.show(); } }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 9px;
+        spacing: 6px;
+        Text {
+            text: root.current;
+            font-size: 12px;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Path {
+            width: 9px;
+            height: 5px;
+            y: (parent.height - self.height) / 2;
+            viewbox-width: 10;
+            viewbox-height: 6;
+            commands: "M1 1l4 4 4-4";
+            stroke: Theme.text-muted;
+            stroke-width: 1.5px;
+            fill: transparent;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        x: root.width - root.popup-width;
+        y: root.height + 4px;
+        width: root.popup-width;
+        Rectangle {
+            background: Theme.surface;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000059;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 1px;
+                for option[i] in root.options: Rectangle {
+                    height: 30px;
+                    border-radius: 6px;
+                    background: item.has-hover ? Theme.surface-hover : transparent;
+                    accessible-role: list-item;
+                    accessible-label: option;
+                    accessible-action-default => { root.picked(i); }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: option;
+                            font-size: 12px;
+                            font-weight: i == root.selected ? 600 : 400;
+                            color: i == root.selected ? Theme.accent : Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        if i == root.selected: Path {
+                            width: 11px;
+                            height: 8px;
+                            y: (parent.height - self.height) / 2;
+                            viewbox-width: 12;
+                            viewbox-height: 9;
+                            commands: "M1 4.5l3.5 3.5 6.5-7";
+                            stroke: Theme.accent;
+                            stroke-width: 1.7px;
+                            fill: transparent;
+                        }
+                    }
+                    item := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.picked(i); }
+                    }
+                }
+            }
+        }
+    }
+}

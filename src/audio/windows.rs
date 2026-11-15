@@ -5,26 +5,44 @@
 //! active render device**, not just the default one, so apps routed to headphones
 //! or a virtual device are found too. Sessions are grouped by executable name.
 //!
-//! Full per-app volume and mute are natively supported (`ISimpleAudioVolume`).
+//! Full per-app volume and mute are natively supported (`ISimpleAudioVolume`). System
+//! volume uses `IAudioEndpointVolume` on the default device.
+//!
+//! # Undocumented interfaces
+//! Windows has no *public* API to change the default output device or an app's output
+//! device, yet both are what the Sound settings page does. HushKey uses the same private
+//! COM interfaces as EarTrumpet, SoundSwitch and friends:
+//! - `IPolicyConfig` (`CPolicyConfigClient`) → `SetDefaultEndpoint`, stable since Vista.
+//! - `IAudioPolicyConfigFactory` (`Windows.Media.Internal.AudioPolicyConfig`) →
+//!   `Set/GetPersistedDefaultAudioEndpoint`, Windows 10 1803+. Its IID changed in 21H2,
+//!   so both are tried. If neither works the feature is reported unsupported instead of
+//!   failing. Windows itself persists the per-app choice (by executable), like the
+//!   "App volume and device preferences" page.
+//!
 //! Threading: this type must stay on the thread that created it (COM MTA init).
 
-use super::{AudioApp, AudioController, AudioError, AudioResult, Capabilities, IconData};
+use super::{AudioApp, AudioController, AudioError, AudioResult, Capabilities, IconData, MasterVolume, OutputDevice};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
+use windows::core::{Interface, GUID, HRESULT, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, S_OK};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
 };
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    eRender, AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
-    ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eConsole, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -33,6 +51,103 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, I
 
 const SYSTEM_SOUNDS_KEY: &str = "system-sounds";
 const ICON_SIZE: u32 = 64;
+
+// ── Private policy-config interfaces (see module docs) ─────────────────────────────
+// Only the methods HushKey calls have real signatures; the others are vtable padding.
+
+const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+const AUDIO_POLICY_CONFIG_CLASS: &str = "Windows.Media.Internal.AudioPolicyConfig";
+/// IID since Windows 10 21H2 (build 21390+), then the one used by 1803–21H1.
+const AUDIO_POLICY_CONFIG_IIDS: [GUID; 2] =
+    [GUID::from_u128(0xab3d4648_e242_459f_b02f_541c70306324), GUID::from_u128(0x2a59116d_6c4f_45e0_a74f_707e3fef9258)];
+const MMDEVAPI_PREFIX: &str = r"\\?\SWD#MMDEVAPI#";
+const RENDER_INTERFACE_SUFFIX: &str = "#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+mod policy {
+    #![allow(non_snake_case, dead_code)]
+    use std::ffi::c_void;
+    use windows::core::{IUnknown, IUnknown_Vtbl, HRESULT, PCWSTR};
+    use windows::Win32::Media::Audio::{EDataFlow, ERole};
+
+    #[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+    pub unsafe trait IPolicyConfig: IUnknown {
+        pub fn GetMixFormat(&self) -> HRESULT;
+        pub fn GetDeviceFormat(&self) -> HRESULT;
+        pub fn ResetDeviceFormat(&self) -> HRESULT;
+        pub fn SetDeviceFormat(&self) -> HRESULT;
+        pub fn GetProcessingPeriod(&self) -> HRESULT;
+        pub fn SetProcessingPeriod(&self) -> HRESULT;
+        pub fn GetShareMode(&self) -> HRESULT;
+        pub fn SetShareMode(&self) -> HRESULT;
+        pub fn GetPropertyValue(&self) -> HRESULT;
+        pub fn SetPropertyValue(&self) -> HRESULT;
+        pub fn SetDefaultEndpoint(&self, device_id: PCWSTR, role: ERole) -> HRESULT;
+        pub fn SetEndpointVisibility(&self) -> HRESULT;
+    }
+
+    // The IID here is only used by `cast()`, which HushKey never does: the factory is
+    // obtained via `RoGetActivationFactory` with whichever IID the OS accepts (same layout).
+    #[windows::core::interface("ab3d4648-e242-459f-b02f-541c70306324")]
+    pub unsafe trait IAudioPolicyConfigFactory: IUnknown {
+        // IInspectable
+        pub fn GetIids(&self) -> HRESULT;
+        pub fn GetRuntimeClassName(&self) -> HRESULT;
+        pub fn GetTrustLevel(&self) -> HRESULT;
+        pub fn add_CtxVolumeChange(&self) -> HRESULT;
+        pub fn remove_CtxVolumeChanged(&self) -> HRESULT;
+        pub fn add_RingerVibrateStateChanged(&self) -> HRESULT;
+        pub fn remove_RingerVibrateStateChange(&self) -> HRESULT;
+        pub fn SetVolumeGroupGainForId(&self) -> HRESULT;
+        pub fn GetVolumeGroupGainForId(&self) -> HRESULT;
+        pub fn GetActiveVolumeGroupForEndpointId(&self) -> HRESULT;
+        pub fn GetVolumeGroupsForEndpoint(&self) -> HRESULT;
+        pub fn GetCurrentVolumeContext(&self) -> HRESULT;
+        pub fn SetVolumeGroupMuteForId(&self) -> HRESULT;
+        pub fn GetVolumeGroupMuteForId(&self) -> HRESULT;
+        pub fn SetRingerVibrateState(&self) -> HRESULT;
+        pub fn GetRingerVibrateState(&self) -> HRESULT;
+        pub fn SetPreferredChatApplication(&self) -> HRESULT;
+        pub fn ResetPreferredChatApplication(&self) -> HRESULT;
+        pub fn GetPreferredChatApplication(&self) -> HRESULT;
+        pub fn GetCurrentChatApplications(&self) -> HRESULT;
+        pub fn add_ChatContextChanged(&self) -> HRESULT;
+        pub fn remove_ChatContextChanged(&self) -> HRESULT;
+        // `device_id` is a borrowed HSTRING handle (null = back to the system default).
+        pub fn SetPersistedDefaultAudioEndpoint(
+            &self,
+            pid: u32,
+            flow: EDataFlow,
+            role: ERole,
+            device_id: *mut c_void,
+        ) -> HRESULT;
+        // Writes an owned HSTRING handle to `device_id` (null when the app follows the default).
+        pub fn GetPersistedDefaultAudioEndpoint(
+            &self,
+            pid: u32,
+            flow: EDataFlow,
+            role: ERole,
+            device_id: *mut *mut c_void,
+        ) -> HRESULT;
+        pub fn ClearAllPersistedApplicationDefaultEndpoints(&self) -> HRESULT;
+    }
+}
+use policy::{IAudioPolicyConfigFactory, IPolicyConfig};
+
+fn audio_policy_factory() -> Option<IAudioPolicyConfigFactory> {
+    windows::core::link!("api-ms-win-core-winrt-l1-1-0.dll" "system" fn RoGetActivationFactory(class: *mut c_void, iid: *const GUID, factory: *mut *mut c_void) -> HRESULT);
+    let class = HSTRING::from(AUDIO_POLICY_CONFIG_CLASS);
+    for iid in &AUDIO_POLICY_CONFIG_IIDS {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: HSTRING is a transparent handle; the factory comes back +1 and from_raw adopts it.
+        let hr = unsafe { RoGetActivationFactory(std::mem::transmute_copy(&class), iid, &mut raw) };
+        if hr.is_ok() && !raw.is_null() {
+            return Some(unsafe { IAudioPolicyConfigFactory::from_raw(raw) });
+        }
+    }
+    log::info!("per-app output devices unavailable (AudioPolicyConfig factory not found)");
+    None
+}
 
 fn err(context: &str, e: windows::core::Error) -> AudioError {
     AudioError::Backend(format!("{context}: {e}"))
@@ -62,6 +177,8 @@ impl Drop for ComGuard {
 pub struct WasapiController {
     enumerator: IMMDeviceEnumerator,
     procs: HashMap<u32, ProcInfo>,
+    device_names: HashMap<String, String>,
+    policy: Option<IAudioPolicyConfigFactory>,
     _com: ComGuard,
 }
 
@@ -72,8 +189,53 @@ impl WasapiController {
             let guard = ComGuard;
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| err("MMDeviceEnumerator", e))?;
-            Ok(Self { enumerator, procs: HashMap::new(), _com: guard })
+            Ok(Self {
+                enumerator,
+                procs: HashMap::new(),
+                device_names: HashMap::new(),
+                policy: audio_policy_factory(),
+                _com: guard,
+            })
         }
+    }
+
+    fn default_device(&self) -> AudioResult<IMMDevice> {
+        unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) }.map_err(|e| err("default device", e))
+    }
+
+    fn endpoint_volume(&self) -> AudioResult<IAudioEndpointVolume> {
+        let device = self.default_device()?;
+        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(|e| err("endpoint volume", e))
+    }
+
+    fn device_name(&mut self, device: &IMMDevice, id: &str) -> String {
+        if let Some(n) = self.device_names.get(id) {
+            return n.clone();
+        }
+        let name = unsafe {
+            device
+                .OpenPropertyStore(STGM_READ)
+                .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
+                .and_then(|value| PropVariantToStringAlloc(&value))
+                .ok()
+                .map(take_pwstr)
+        }
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Unknown device".to_owned());
+        self.device_names.insert(id.to_owned(), name.clone());
+        name
+    }
+
+    /// The device an app is explicitly routed to, from the first of its processes that has one.
+    fn persisted_device(&self, pids: &[u32]) -> Option<String> {
+        let policy = self.policy.as_ref()?;
+        pids.iter().filter(|p| **p != 0).find_map(|&pid| unsafe {
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            policy.GetPersistedDefaultAudioEndpoint(pid, eRender, eMultimedia, &mut raw).ok().ok()?;
+            // SAFETY: an owned HSTRING handle (or null = empty); HSTRING frees it on drop.
+            let s: HSTRING = std::mem::transmute::<*mut c_void, HSTRING>(raw);
+            unpack_device_id(&s.to_string_lossy())
+        })
     }
 
     fn proc_info(&mut self, pid: u32) -> ProcInfo {
@@ -160,7 +322,13 @@ impl AudioController for WasapiController {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { per_app_volume: true, per_app_mute: true }
+        Capabilities {
+            per_app_volume: true,
+            per_app_mute: true,
+            per_app_device: self.policy.is_some(),
+            master_volume: true,
+            output_devices: true,
+        }
     }
 
     fn list_audio_apps(&mut self) -> AudioResult<Vec<AudioApp>> {
@@ -181,14 +349,17 @@ impl AudioController for WasapiController {
         let mut apps: Vec<AudioApp> = grouped
             .into_iter()
             .map(|(key, (pids, vols, muted))| {
-                let (name, exe_path) = if key == SYSTEM_SOUNDS_KEY {
+                let system = key == SYSTEM_SOUNDS_KEY;
+                let (name, exe_path) = if system {
                     ("System Sounds".to_owned(), None)
                 } else {
                     let info = pids.iter().find_map(|p| self.procs.get(p)).cloned();
                     info.map(|i| (i.name, i.path)).unwrap_or_else(|| (key.clone(), None))
                 };
                 let volume = Some(vols.iter().sum::<f32>() / vols.len().max(1) as f32);
-                AudioApp { key, name, pids, volume, muted, exe_path }
+                let device = if system { None } else { self.persisted_device(&pids) };
+                let routable = !system && self.policy.is_some();
+                AudioApp { key, name, pids, volume, muted, exe_path, device, routable }
             })
             .collect();
         apps.sort_by_key(|a| a.name.to_lowercase());
@@ -204,9 +375,110 @@ impl AudioController for WasapiController {
         self.for_each_session_of(app, |s| unsafe { s.SetMute(muted, std::ptr::null()) })
     }
 
+    fn output_devices(&mut self) -> AudioResult<Vec<OutputDevice>> {
+        let default_id = self.default_device().ok().and_then(|d| unsafe { d.GetId() }.ok()).map(take_pwstr);
+        let mut out = Vec::new();
+        unsafe {
+            let devices = self
+                .enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .map_err(|e| err("EnumAudioEndpoints", e))?;
+            for i in 0..devices.GetCount().map_err(|e| err("GetCount", e))? {
+                let Ok(device) = devices.Item(i) else { continue };
+                let Ok(id) = device.GetId().map(take_pwstr) else { continue };
+                let name = self.device_name(&device, &id);
+                out.push(OutputDevice { is_default: default_id.as_deref() == Some(id.as_str()), id, name });
+            }
+        }
+        out.sort_by_key(|d| d.name.to_lowercase());
+        Ok(out)
+    }
+
+    fn set_default_output_device(&mut self, id: &str) -> AudioResult<()> {
+        unsafe {
+            let policy: IPolicyConfig =
+                CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL).map_err(|e| err("PolicyConfig", e))?;
+            let wide_id = HSTRING::from(id);
+            for role in [eConsole, eMultimedia] {
+                policy
+                    .SetDefaultEndpoint(PCWSTR(wide_id.as_ptr()), role)
+                    .ok()
+                    .map_err(|e| err("SetDefaultEndpoint", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn master_volume(&mut self) -> AudioResult<MasterVolume> {
+        let ep = self.endpoint_volume()?;
+        unsafe {
+            Ok(MasterVolume {
+                volume: ep.GetMasterVolumeLevelScalar().ok(),
+                muted: ep.GetMute().map(|b| b.as_bool()).unwrap_or(false),
+            })
+        }
+    }
+
+    fn set_master_volume(&mut self, volume: f32) -> AudioResult<()> {
+        let ep = self.endpoint_volume()?;
+        unsafe { ep.SetMasterVolumeLevelScalar(volume.clamp(0.0, 1.0), std::ptr::null()) }
+            .map_err(|e| err("system volume", e))
+    }
+
+    fn set_master_mute(&mut self, muted: bool) -> AudioResult<()> {
+        let ep = self.endpoint_volume()?;
+        unsafe { ep.SetMute(muted, std::ptr::null()) }.map_err(|e| err("system mute", e))
+    }
+
+    fn set_app_output_device(&mut self, app: &str, device: Option<&str>) -> AudioResult<()> {
+        if app == SYSTEM_SOUNDS_KEY {
+            return Err(AudioError::Unsupported("routing system sounds"));
+        }
+        let Some(policy) = self.policy.clone() else {
+            return Err(AudioError::Unsupported("per-app output devices (needs Windows 10 1803 or newer)"));
+        };
+        let mut pids: Vec<u32> = self.sessions()?.into_iter().filter(|s| s.key == app).map(|s| s.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.is_empty() {
+            return Err(AudioError::NotRunning(app.to_owned()));
+        }
+        let packed = device.map(|id| HSTRING::from(format!("{MMDEVAPI_PREFIX}{id}{RENDER_INTERFACE_SUFFIX}")));
+        // SAFETY: a borrowed handle that outlives the calls; null resets the app to the default.
+        let raw: *mut c_void =
+            packed.as_ref().map(|h| unsafe { std::mem::transmute_copy(h) }).unwrap_or(std::ptr::null_mut());
+        for pid in pids {
+            for role in [eConsole, eMultimedia] {
+                unsafe { policy.SetPersistedDefaultAudioEndpoint(pid, eRender, role, raw) }
+                    .ok()
+                    .map_err(|e| err("SetPersistedDefaultAudioEndpoint", e))?;
+            }
+        }
+        Ok(())
+    }
+
     fn app_icon(&mut self, app: &AudioApp) -> Option<IconData> {
         exe_icon(app.exe_path.as_deref()?)
     }
+}
+
+/// Copy a CoTaskMem-allocated wide string and free it.
+fn take_pwstr(p: PWSTR) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let s = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s
+    }
+}
+
+/// `\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{e6327cad-…}` → `{0.0.0.00000000}.{guid}`.
+fn unpack_device_id(s: &str) -> Option<String> {
+    let s = s.strip_prefix(MMDEVAPI_PREFIX).unwrap_or(s);
+    let s = s.strip_suffix(RENDER_INTERFACE_SUFFIX).unwrap_or(s);
+    (!s.is_empty()).then(|| s.to_owned())
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -336,4 +608,17 @@ unsafe fn hicon_to_rgba(icon: HICON) -> Option<IconData> {
         }
     }
     Some(IconData { width: w as u32, height: h as u32, rgba: buf })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_id_round_trip() {
+        let id = "{0.0.0.00000000}.{5c6a2d1e-7a3b-4c1d-9e2f-1a2b3c4d5e6f}";
+        let packed = format!("{MMDEVAPI_PREFIX}{id}{RENDER_INTERFACE_SUFFIX}");
+        assert_eq!(unpack_device_id(&packed).as_deref(), Some(id));
+        assert_eq!(unpack_device_id(""), None);
+    }
 }

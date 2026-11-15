@@ -6,11 +6,11 @@
 //! surfaces, render buffers or UI trees.
 
 use crate::audio::worker::{self, AudioCommand, AudioEvent, AudioHandle};
-use crate::audio::{AudioApp, Capabilities};
+use crate::audio::{AudioApp, Capabilities, MasterVolume, OutputDevice};
 use crate::config::{Config, ConfigStore, Theme};
 use crate::hotkeys::{capture_from_key_event, Accelerator, Capture, HotkeyAction, Hotkeys};
 use crate::platform;
-use crate::ui::icon::{self, IconState};
+use crate::ui::icon::IconState;
 use crate::ui::toast::ToastPresenter;
 use crate::ui::tray::{Tray, TrayCommand};
 use crate::{AppRow, MainWindow};
@@ -23,6 +23,7 @@ use std::time::Duration;
 const REFRESH_EVERY: Duration = Duration::from_millis(1500);
 const TARGET_ALL: &str = "@all";
 const TARGET_RESTORE: &str = "@restore";
+const SYSTEM_DEFAULT_LABEL: &str = "System default";
 
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -49,6 +50,11 @@ pub struct App {
     rows: Rc<VecModel<AppRow>>,
     apps: RefCell<Vec<AudioApp>>,
     icons: RefCell<HashMap<String, slint::Image>>,
+    devices: RefCell<Vec<OutputDevice>>,
+    master: Cell<Option<MasterVolume>>,
+    /// Device names for the system picker, and "System default" + names for app pickers.
+    device_names: Rc<VecModel<SharedString>>,
+    app_device_options: Rc<VecModel<SharedString>>,
     all_muted: Cell<bool>,
     caps: Cell<Capabilities>,
     backend: RefCell<String>,
@@ -98,8 +104,12 @@ impl App {
             rows: Rc::new(VecModel::default()),
             apps: RefCell::default(),
             icons: RefCell::default(),
+            devices: RefCell::default(),
+            master: Cell::new(None),
+            device_names: Rc::new(VecModel::default()),
+            app_device_options: Rc::new(VecModel::from(vec![SharedString::from(SYSTEM_DEFAULT_LABEL)])),
             all_muted: Cell::new(false),
-            caps: Cell::new(Capabilities { per_app_volume: true, per_app_mute: true }),
+            caps: Cell::new(Capabilities { per_app_volume: true, per_app_mute: true, ..Capabilities::default() }),
             backend: RefCell::new("starting…".into()),
             platform_note: RefCell::default(),
             capturing: RefCell::new(None),
@@ -231,6 +241,8 @@ impl App {
         w.set_version(env!("CARGO_PKG_VERSION").into());
         w.set_config_path(self.store.path().display().to_string().into());
         w.set_apps(ModelRc::from(self.rows.clone()));
+        w.set_output_devices(ModelRc::from(self.device_names.clone()));
+        w.set_app_device_options(ModelRc::from(self.app_device_options.clone()));
 
         w.window().on_close_requested(|| {
             // Can't drop the component from inside its own callback; do it next tick.
@@ -263,6 +275,24 @@ impl App {
         });
         w.on_dismiss_status(|| {
             with_app(|a| a.set_status("", false));
+        });
+        w.on_set_app_volume(|key, v| {
+            with_app(|a| a.set_app_volume(key.as_str(), v));
+        });
+        w.on_pick_app_device(|key, i| {
+            with_app(|a| a.pick_app_device(key.as_str(), i));
+        });
+        w.on_set_master_volume(|v| {
+            with_app(|a| a.set_master_volume(v));
+        });
+        w.on_toggle_master_mute(|| {
+            with_app(|a| a.toggle_master_mute());
+        });
+        w.on_pick_default_device(|i| {
+            with_app(|a| a.pick_default_device(i));
+        });
+        w.on_open_url(|url| {
+            platform::open_url(url.as_str());
         });
         w.on_open_config_dir(|| {
             with_app(|a| {
@@ -299,7 +329,11 @@ impl App {
     fn push_all(&self, w: &MainWindow) {
         w.set_backend(self.backend.borrow().as_str().into());
         w.set_platform_note(self.platform_note.borrow().as_str().into());
-        w.set_show_volume(self.caps.get().per_app_volume);
+        let caps = self.caps.get();
+        w.set_show_volume(caps.per_app_volume);
+        w.set_show_app_device(caps.per_app_device);
+        w.set_show_master_volume(caps.master_volume && self.master.get().is_some());
+        w.set_show_output_devices(caps.output_devices && !self.devices.borrow().is_empty());
         w.set_all_muted(self.all_muted.get());
         let (msg, err) = self.status.borrow().clone();
         w.set_status(msg.into());
@@ -308,7 +342,96 @@ impl App {
         w.set_hotkey_hint("Press a combo · Esc cancels · Backspace clears".into());
         self.push_settings_to(w);
         self.push_shortcuts_to(w);
+        self.push_output_to(w);
         self.sync_rows();
+    }
+
+    fn push_output_to(&self, w: &MainWindow) {
+        let caps = self.caps.get();
+        let master = self.master.get();
+        w.set_show_master_volume(caps.master_volume && master.is_some());
+        w.set_show_output_devices(caps.output_devices && !self.devices.borrow().is_empty());
+        w.set_master_volume(master.and_then(|m| m.volume).unwrap_or(-1.0));
+        w.set_master_muted(master.is_some_and(|m| m.muted));
+        let devices = self.devices.borrow();
+        w.set_default_device_index(devices.iter().position(|d| d.is_default).map_or(-1, |i| i as i32));
+    }
+
+    /// Rebuild the picker models only when the device set actually changed.
+    fn sync_device_models(&self) {
+        let devices = self.devices.borrow();
+        let names: Vec<SharedString> = devices.iter().map(|d| SharedString::from(d.name.as_str())).collect();
+        let current: Vec<SharedString> = self.device_names.iter().collect();
+        if current != names {
+            let mut options = Vec::with_capacity(names.len() + 1);
+            options.push(SharedString::from(SYSTEM_DEFAULT_LABEL));
+            options.extend(names.iter().cloned());
+            self.device_names.set_vec(names);
+            self.app_device_options.set_vec(options);
+        }
+    }
+
+    // ── Volume & devices ───────────────────────────────────────────────────────
+    // The UI is updated optimistically; the next refresh confirms what the OS did.
+
+    fn set_app_volume(&self, key: &str, volume: f32) {
+        if let Some(a) = self.apps.borrow_mut().iter_mut().find(|a| a.key == key) {
+            a.volume = Some(volume);
+        }
+        self.sync_rows();
+        self.send(AudioCommand::SetAppVolume { key: key.to_owned(), volume });
+    }
+
+    fn pick_app_device(&self, key: &str, index: i32) {
+        let device = if index <= 0 {
+            None
+        } else {
+            match self.devices.borrow().get(index as usize - 1) {
+                Some(d) => Some(d.id.clone()),
+                None => return,
+            }
+        };
+        if let Some(a) = self.apps.borrow_mut().iter_mut().find(|a| a.key == key) {
+            a.device = device.clone();
+        }
+        self.sync_rows();
+        self.send(AudioCommand::SetAppDevice { key: key.to_owned(), device });
+    }
+
+    fn set_master_volume(&self, volume: f32) {
+        if let Some(mut m) = self.master.get() {
+            m.volume = Some(volume);
+            self.master.set(Some(m));
+        }
+        if let Some(w) = self.ui() {
+            self.push_output_to(&w);
+        }
+        self.send(AudioCommand::SetMasterVolume(volume));
+    }
+
+    fn toggle_master_mute(&self) {
+        let Some(mut m) = self.master.get() else { return };
+        m.muted = !m.muted;
+        self.master.set(Some(m));
+        if let Some(w) = self.ui() {
+            self.push_output_to(&w);
+        }
+        self.send(AudioCommand::SetMasterMute(m.muted));
+    }
+
+    fn pick_default_device(&self, index: i32) {
+        let id = {
+            let mut devices = self.devices.borrow_mut();
+            let Some(id) = devices.get(index.max(0) as usize).map(|d| d.id.clone()) else { return };
+            for d in devices.iter_mut() {
+                d.is_default = d.id == id;
+            }
+            id
+        };
+        if let Some(w) = self.ui() {
+            self.push_output_to(&w);
+        }
+        self.send(AudioCommand::SetDefaultDevice(id));
     }
 
     fn push_settings(&self) {
@@ -348,27 +471,19 @@ impl App {
         let cfg = self.cfg.borrow();
         let apps = self.apps.borrow();
         let icons = self.icons.borrow();
+        let devices = self.devices.borrow();
         let caps = self.caps.get();
 
         let mut rows: Vec<AppRow> = Vec::with_capacity(apps.len() + cfg.bindings.len());
         for a in apps.iter() {
-            let status = if a.muted {
-                "Muted".to_owned()
-            } else if let (true, Some(v)) = (caps.per_app_volume, a.volume) {
-                format!("Volume {}%", (v * 100.0).round())
-            } else {
-                "Active".to_owned()
-            };
-            rows.push(make_row(
-                &a.key,
-                &a.name,
-                &format!("{status} · {}", a.key),
-                true,
-                a.muted,
-                a.volume,
-                &cfg,
-                &icons,
-            ));
+            let status = if a.muted { "Muted" } else { "Active" };
+            let mut row =
+                make_row(&a.key, &a.name, &format!("{status} · {}", a.key), true, a.muted, a.volume, &cfg, &icons);
+            row.volume = if caps.per_app_volume { a.volume.unwrap_or(-1.0) } else { -1.0 };
+            row.routable = a.routable;
+            row.device_index =
+                a.device.as_ref().and_then(|id| devices.iter().position(|d| &d.id == id)).map_or(0, |i| i as i32 + 1);
+            rows.push(row);
         }
         // Bound apps that aren't running stay visible so their shortcut can be edited.
         for b in &cfg.bindings {
@@ -418,6 +533,18 @@ impl App {
             AudioEvent::Apps(apps) => {
                 *self.apps.borrow_mut() = apps;
                 self.sync_rows();
+            }
+            AudioEvent::Output { devices, master } => {
+                let changed = *self.devices.borrow() != devices;
+                *self.devices.borrow_mut() = devices;
+                self.master.set(master);
+                if changed {
+                    self.sync_device_models();
+                    self.sync_rows(); // device indices shift when devices come and go
+                }
+                if let Some(w) = self.ui() {
+                    self.push_output_to(&w);
+                }
             }
             AudioEvent::Icon { key, icon } => {
                 self.icons.borrow_mut().insert(key, crate::ui::image_from_icon(&icon));
@@ -628,21 +755,17 @@ impl App {
     }
 }
 
-/// Title-bar theme (dark title bar on Windows 10/11, appearance on macOS) and window icon.
+/// Title-bar theme (dark title bar on Windows 10/11, appearance on macOS) and window icons.
+/// The icons are also set at window creation (`ui::with_app_icons`); setting them again
+/// here covers windows that already existed.
 fn apply_native_chrome(w: &slint::winit_030::winit::window::Window, dark: bool) {
-    use slint::winit_030::winit::window::{Icon, Theme as WinitTheme};
+    use slint::winit_030::winit::window::Theme as WinitTheme;
     w.set_theme(Some(if dark { WinitTheme::Dark } else { WinitTheme::Light }));
-    // Small icon: title bar / Alt+Tab.
-    if let Ok(icon) = Icon::from_rgba(icon::render(32, IconState::Normal), 32, 32) {
-        w.set_window_icon(Some(icon));
-    }
-    // Windows uses a separate "big" icon for the taskbar; winit only sets it on request.
+    w.set_window_icon(crate::ui::winit_icon(32));
     #[cfg(target_os = "windows")]
     {
         use slint::winit_030::winit::platform::windows::WindowExtWindows;
-        if let Ok(icon) = Icon::from_rgba(icon::render(64, IconState::Normal), 64, 64) {
-            w.set_taskbar_icon(Some(icon));
-        }
+        w.set_taskbar_icon(crate::ui::winit_icon(64));
     }
 }
 
@@ -674,5 +797,7 @@ fn make_row(
         muted,
         volume: volume.unwrap_or(-1.0),
         shortcut: label(cfg.binding_for(key).map(|b| b.hotkey.as_str())).into(),
+        routable: false,
+        device_index: 0,
     }
 }

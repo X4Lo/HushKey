@@ -45,12 +45,19 @@ HushKey is a single Rust binary with four layers. Only `src/audio/{windows,macos
 ```rust
 pub trait AudioController {
     fn backend_name(&self) -> &'static str;
-    fn capabilities(&self) -> Capabilities;                 // per_app_volume / per_app_mute
+    fn capabilities(&self) -> Capabilities; // per-app volume/mute/device, master volume, devices
     fn list_audio_apps(&mut self) -> AudioResult<Vec<AudioApp>>;
     fn set_app_volume(&mut self, app: &str, volume: f32) -> AudioResult<()>;
     fn set_app_mute(&mut self, app: &str, muted: bool) -> AudioResult<()>;
     fn mute_all(&mut self) -> AudioResult<MuteSnapshot>;    // default impl
     fn restore_all(&mut self, snapshot: &MuteSnapshot) -> AudioResult<()>; // default impl
+    // Optional; the defaults return Unsupported / nothing:
+    fn output_devices(&mut self) -> AudioResult<Vec<OutputDevice>>;
+    fn set_default_output_device(&mut self, id: &str) -> AudioResult<()>;
+    fn master_volume(&mut self) -> AudioResult<MasterVolume>;
+    fn set_master_volume(&mut self, volume: f32) -> AudioResult<()>;
+    fn set_master_mute(&mut self, muted: bool) -> AudioResult<()>;
+    fn set_app_output_device(&mut self, app: &str, device: Option<&str>) -> AudioResult<()>;
     fn app_icon(&mut self, app: &AudioApp) -> Option<IconData> { None }
     fn platform_note(&self) -> Option<&'static str> { None }
 }

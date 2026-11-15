@@ -31,7 +31,11 @@ The original spec described muting as "set volume to 0, restore the previous vol
 - If HushKey crashes or is killed while apps are muted, nothing is stuck at 0%. The user unmutes in the system mixer as usual. On macOS, taps are released automatically when the process exits.
 - The OS mixer UI shows the app as muted, which matches what the user sees in HushKey.
 
-`set_app_volume` is still implemented on Windows and Linux as part of the backend contract.
+Volume sliders are independent of the mute flag: moving a slider changes the level, and a muted app stays muted. Slider drags send a command per mouse move; the audio thread coalesces them so only the latest level is applied, and the UI updates optimistically so the knob never jumps.
+
+## Output devices
+
+The Apps page has a system-volume card with a picker for the default output device, and every app row has its own device picker ("System default" or a specific device). HushKey doesn't store these choices: the OS already persists them per app (Windows' "App volume and device preferences", PulseAudio's stream-restore module / PipeWire), so they keep working without HushKey running.
 
 ## Stable app identity
 
@@ -62,7 +66,9 @@ macOS has **no public API to change another process's volume**. The CoreAudio HA
 **HushKey uses option 2.** As a result:
 
 - ✅ Per-app **mute/unmute** works (that's all HushKey's shortcuts need).
-- ❌ Per-app **volume levels** are not possible. The backend reports `per_app_volume: false`, the UI hides volume bars, and `set_app_volume` returns `Unsupported` for values between 0 and 1. It never fakes a level.
+- ❌ Per-app **volume levels** are not possible. The backend reports `per_app_volume: false`, the UI hides volume sliders, and `set_app_volume` returns `Unsupported` for values between 0 and 1. It never fakes a level.
+- ❌ Per-app **output devices** are not possible either (no public API to reroute another process). The backend reports `per_app_device: false` and the UI hides the per-app picker.
+- ✅ **System volume**, system mute and switching the **default output device** use public Core Audio properties and work normally.
 - Requires **macOS 14.2+**. The tap functions are resolved with `dlsym` at runtime, so the binary still launches on older macOS. There, apps are listed read-only and a banner explains why.
 - Requires the **Screen & System Audio Recording** permission. The app bundle must declare `NSAudioCaptureUsageDescription` (see [building.md](building.md#macos)).
 - Apps are grouped by their outermost `.app` bundle, so helper processes (e.g. Chrome's renderer helpers) are muted together. When an app spawns a new helper while muted, the tap is rebuilt on the next refresh.
@@ -80,3 +86,5 @@ GNOME Shell doesn't show StatusNotifierItem icons without an extension. If no tr
 ### Windows
 
 The Windows backend is fully native. Sessions are enumerated on every active output device, not just the default one, so apps routed to a headset or virtual device are found. Protected processes HushKey can't open are still controllable; they're listed as "Process <pid>" with a PID-based key, which can't be bound persistently.
+
+Changing the default output device and an app's output device has **no public Windows API**, even though the Settings app does both. HushKey uses the same undocumented COM interfaces as EarTrumpet and SoundSwitch: `IPolicyConfig::SetDefaultEndpoint` (stable since Vista) and `IAudioPolicyConfigFactory::SetPersistedDefaultAudioEndpoint` (Windows 10 1803+; its IID changed in 21H2, so both IIDs are tried). If the per-app interface can't be created, the backend reports `per_app_device: false` and the per-app pickers are hidden. Some apps only switch device when they next open an audio stream (e.g. on the next track or after a restart); that's how Windows itself behaves too. System sounds can't be rerouted.

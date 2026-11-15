@@ -40,6 +40,22 @@ pub fn open_folder(path: &Path) {
     }
 }
 
+/// Open an http(s) URL in the default browser.
+pub fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = result {
+        log::warn!("open {url}: {e}");
+    }
+}
+
 // ── Single instance ────────────────────────────────────────────────────────────
 // A loopback-only socket doubles as lock and "show yourself" signal: launching HushKey
 // again just brings the running window up. Loopback binds don't trigger firewall prompts.
